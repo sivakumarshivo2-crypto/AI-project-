@@ -1,0 +1,294 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
+import tensorflow as tf
+from tensorflow.keras import layers, models, backend as K
+from tqdm import trange
+import warnings
+warnings.filterwarnings("ignore")
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+
+def load_default_series():
+    """Load a default benchmark series (monthly sunspots)."""
+    import statsmodels.api as sm
+    data = sm.datasets.sunspots.load_pandas().data
+    # dataset has columns YEAR and SUNACTIVITY; create a datetime index approximate
+    # we'll treat it as yearly index — but it's fine for demonstration
+    series = data['SUNACTIVITY'].astype(float)
+    series.index = pd.RangeIndex(start=0, stop=len(series), step=1)
+    return series
+
+def load_csv_series(csv_path, date_col=None, value_col=None):
+    """Load user CSV; attempts to parse date_col and value_col if provided."""
+    df = pd.read_csv(csv_path)
+    if date_col and value_col:
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col)
+        s = pd.Series(df[value_col].values, index=df[date_col])
+    else:
+        # default: use first numeric column
+        numeric = df.select_dtypes(include=[np.number])
+        if numeric.shape[1] == 0:
+            raise ValueError("No numeric columns found in CSV.")
+        s = pd.Series(numeric.iloc[:, 0].values, index=pd.RangeIndex(len(numeric)))
+    return s.astype(float)
+
+def adf_test(series):
+    """Run Augmented Dickey-Fuller test and return statistic, pvalue."""
+    res = adfuller(series.dropna())
+    return {'adf_stat': res[0], 'pvalue': res[1], 'usedlag': res[2], 'nobs': res[3]}
+
+def make_sequences(values, input_len, output_len):
+    """
+    Create supervised sequences.
+    values: 1D array
+    returns X (n_samples, input_len, 1), y (n_samples, output_len)
+    """
+    X, y = [], []
+    for i in range(len(values) - input_len - output_len + 1):
+        X.append(values[i:i+input_len])
+        y.append(values[i+input_len:i+input_len+output_len])
+    X = np.array(X)[:,:,None]
+    y = np.array(y)
+    return X, y
+
+def build_lstm_mc(input_len, output_len, dropout_rate=0.2, units=64):
+    """
+    Build a simple LSTM with dropout that can be used with MC Dropout
+    Dropout layers are kept and we will call model(x, training=True) when predicting.
+    """
+    inp = layers.Input(shape=(input_len, 1))
+    x = layers.LSTM(units, return_sequences=False)(inp)
+    x = layers.Dropout(dropout_rate)(x)
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dropout(dropout_rate)(x)
+    out = layers.Dense(output_len)(x)
+    model = models.Model(inp, out)
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+def mc_dropout_predict(model, X, T=100, batch_size=64):
+    """
+    Perform T stochastic forward passes with dropout enabled.
+    Returns: predictions shape (T, n_samples, output_len)
+    """
+    preds = []
+    for _ in range(T):
+        # Removed unsupported arguments like steps, callbacks, max_queue_size, use_multiprocessing
+        preds.append(model.predict(X, batch_size=batch_size, verbose=0))
+    preds = np.stack(preds, axis=0)
+    return preds
+
+def compute_interval_metrics(y_true, samples, alpha):
+    """
+    y_true: (n_samples, output_len)
+    samples: (T, n_samples, output_len)
+    alpha: e.g., 0.2 for 80% interval (i.e., central 1-alpha)
+    Returns:
+      - coverage: fraction of true values within (L,U) across samples and horizons
+      - MIS: mean interval score across values
+    """
+    lower_q = alpha/2
+    upper_q = 1 - alpha/2
+    lower = np.quantile(samples, lower_q, axis=0)
+    upper = np.quantile(samples, upper_q, axis=0)
+    # coverage per element
+    within = ((y_true >= lower) & (y_true <= upper)).astype(int)
+    coverage = within.mean()  # across all samples and horizons
+    # MIS per element
+    # MIS_alpha = (U - L) + 2/alpha * (L - y) * 1(y < L) + 2/alpha * (y - U) * 1(y > U)
+    alpha_val = alpha
+    U_minus_L = (upper - lower)
+    below = np.maximum(0.0, (lower - y_true))
+    above = np.maximum(0.0, (y_true - upper))
+    mis = U_minus_L + (2.0/alpha_val)*(below + above)
+    mis_mean = mis.mean()
+    return coverage, mis_mean, lower, upper
+
+def evaluate_point_metrics(y_true, y_pred):
+    # flatten across horizons and samples
+    rmse = np.sqrt(mean_squared_error(y_true.flatten(), y_pred.flatten()))
+    mae = mean_absolute_error(y_true.flatten(), y_pred.flatten())
+    return rmse, mae
+
+# ---------------------------
+# Main pipeline
+# ---------------------------
+
+def run_pipeline(
+    series,
+    input_len=36,
+    output_len=12,
+    test_fraction=0.2,
+    val_fraction=0.1,
+    units=64,
+    dropout_rate=0.2,
+    batch_size=32,
+    epochs=50,
+    mc_T=200,
+    random_seed=42
+):
+    np.random.seed(random_seed)
+    tf.random.set_seed(random_seed)
+
+    # 1) Preprocess
+    s = series.dropna().astype(float)
+    print("Series length:", len(s))
+    adf = adf_test(s)
+    print("ADF p-value:", adf['pvalue'])
+    # Scaling
+    scaler = StandardScaler()
+    values = scaler.fit_transform(s.values.reshape(-1, 1)).flatten()
+
+    # 2) Create sequences
+    X, y = make_sequences(values, input_len, output_len)
+    n_samples = X.shape[0]
+    # split train/val/test (chronological)
+    test_size = int(n_samples * test_fraction)
+    val_size = int(n_samples * val_fraction)
+    train_end = n_samples - test_size - val_size
+    X_train, y_train = X[:train_end], y[:train_end]
+    X_val, y_val = X[train_end:train_end+val_size], y[train_end:train_end+val_size]
+    X_test, y_test = X[train_end+val_size:], y[train_end+val_size:]
+    print("train/val/test samples:", X_train.shape[0], X_val.shape[0], X_test.shape[0])
+
+    # 3) Build and train model
+    model = build_lstm_mc(input_len, output_len, dropout_rate=dropout_rate, units=units)
+    model.summary()
+    early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[early],
+        verbose=2
+    )
+
+    # 4) Point forecasts (deterministic: using mean prediction)
+    y_pred = model.predict(X_test, batch_size=batch_size)
+    # invert scaling
+    y_test_unscaled = scaler.inverse_transform(y_test.reshape(-1,1)).reshape(y_test.shape)
+    y_pred_unscaled = scaler.inverse_transform(y_pred.reshape(-1,1)).reshape(y_pred.shape)
+    rmse, mae = evaluate_point_metrics(y_test_unscaled, y_pred_unscaled)
+    print(f"Point forecast metrics (LSTM): RMSE={rmse:.4f}, MAE={mae:.4f}")
+
+    # 5) MC Dropout sampling for predictive distribution
+    print(f"Running MC Dropout with T={mc_T} forward passes ...")
+    samples = mc_dropout_predict(model, X_test, T=mc_T, batch_size=batch_size)  # shape (T, n, out)
+    # invert scaling across samples
+    # reshape to (T*n*out, 1) -> inverse_transform -> reshape back
+    T, n, out = samples.shape
+    samples_flat = samples.reshape(-1, 1)
+    samples_inv = scaler.inverse_transform(samples_flat).reshape(T, n, out)
+
+    # y_test unscaled prepared earlier
+
+    # 6) Compute intervals and metrics for 80% and 95%
+    results = {}
+    for alpha in [0.2, 0.05]:  # 80% and 95%
+        cov, mis, lower, upper = compute_interval_metrics(y_test_unscaled, samples_inv, alpha)
+        results[f"{int((1-alpha)*100)}%"] = {'coverage': cov, 'MIS': mis, 'lower': lower, 'upper': upper}
+        print(f"{int((1-alpha)*100)}% interval: coverage={cov:.3f}, MIS={mis:.4f}")
+
+    # 7) Baseline: ARIMA (one-step rolling multi-step naive approach)
+    # We'll fit an ARIMA on the training full series and forecast recursively for the test windows
+    try:
+        # Fit ARIMA on original (unscaled) training portion
+        n_train_points = (train_end + input_len)  # approximate index in original series corresponding to end of training sequences
+        # safer: use first (train_end + input_len) observations
+        arima_train_series = s.values[:n_train_points]
+        arima_model = ARIMA(arima_train_series, order=(5,1,0)).fit()
+        # Forecast next len(X_test) * output_len steps? We'll produce forecasts for each test sequence start
+        # Here use a simple baseline: for each test X, forecast output_len steps via arima.forecast
+        arima_preds = []
+        for i in range(X_test.shape[0]):
+            start_idx = n_train_points + i  # not exact chronological mapping but acceptable baseline
+            f = arima_model.forecast(steps=output_len)
+            arima_preds.append(f)
+        arima_preds = np.array(arima_preds).reshape(y_test_unscaled.shape)
+        arima_rmse, arima_mae = evaluate_point_metrics(y_test_unscaled, arima_preds)
+        print(f"ARIMA baseline: RMSE={arima_rmse:.4f}, MAE={arima_mae:.4f}")
+    except Exception as e:
+        print("ARIMA baseline failed:", e)
+        arima_preds = None
+        arima_rmse = arima_mae = None
+
+    # 8) Plots (example for first test sample)
+    try:
+        idx = 0
+        plt.figure(figsize=(10,4))
+        horizon = np.arange(1, output_len+1)
+        true = y_test_unscaled[idx]
+        pred = y_pred_unscaled[idx]
+        # MC quantiles
+        s_samples = samples_inv[:, idx, :]
+        p10 = np.quantile(s_samples, 0.1, axis=0)
+        p90 = np.quantile(s_samples, 0.9, axis=0)
+        p025 = np.quantile(s_samples, 0.025, axis=0)
+        p975 = np.quantile(s_samples, 0.975, axis=0)
+        plt.plot(horizon, true, marker='o', label='True')
+        plt.plot(horizon, pred, marker='x', label='Deterministic pred')
+        plt.fill_between(horizon, p10, p90, alpha=0.2, label='80% PI (MC)')
+        plt.fill_between(horizon, p025, p975, alpha=0.1, label='95% PI (MC)')
+        if arima_preds is not None:
+            plt.plot(horizon, arima_preds[idx], marker='s', label='ARIMA pred')
+        plt.xlabel('Forecast horizon')
+        plt.legend()
+        plt.title('Example multi-step forecast + predictive intervals (first test sample)')
+        plt.show()
+    except Exception as e:
+        print("Plotting error:", e)
+
+    # 9) Return dictionary of results and objects for further analysis
+    out = {
+        'model': model,
+        'scaler': scaler,
+        'history': history,
+        'y_test': y_test_unscaled,
+        'y_pred': y_pred_unscaled,
+        'mc_samples': samples_inv,
+        'interval_results': results,
+        'point_metrics': {'rmse': rmse, 'mae': mae},
+        'arima': {'preds': arima_preds, 'rmse': arima_rmse, 'mae': arima_mae}
+    }
+    return out
+
+# ---------------------------
+# Run as script
+# ---------------------------
+
+if __name__ == "__main__":
+    # Option: provide CSV path here if you want
+    DATA_CSV = None  # e.g., "my_timeseries.csv"
+    if DATA_CSV and os.path.exists(DATA_CSV):
+        series = load_csv_series(DATA_CSV)
+    else:
+        print("No CSV provided or not found. Loading default sunspots series.")
+        series = load_default_series()
+
+    results = run_pipeline(
+        series,
+        input_len=36,      # adjust for your data frequency
+        output_len=12,
+        test_fraction=0.2,
+        val_fraction=0.1,
+        units=64,
+        dropout_rate=0.2,
+        batch_size=32,
+        epochs=100,
+        mc_T=200
+    )
+
+    # Example: print summary
+    print("Done. Interval results summary:")
+    for k,v in results['interval_results'].items():
+        print(k, v['coverage'], v['MIS'])
