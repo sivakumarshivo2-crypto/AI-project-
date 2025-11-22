@@ -117,6 +117,194 @@ ADF test conducted:
 
 This structure allows the model to learn long-term temporal patterns and make multi-step forecasts.
 
+5. Model Implementation
+
+   The core model is an LSTM neural network tailored for sequential forecasting. It consists of:
+
+Architecture
+
+* Input layer: 36-step sequence
+
+* LSTM layer: 64 units
+
+* Dropout layer: 20% dropout
+
+* Dense ReLU layer: 64 units
+
+*  Dropout layer: additional 20% for stochasticity
+
+*  Output layer: 12 linear units for multi-step prediction
+
+Why This Architecture?
+
+*  LSTM layers capture temporal dependencies
+
+*  Dropout introduces regularization and is reused at inference time for uncertainty
+
+* Dense layers allow nonlinear transformation needed for multi-horizon output
+
+* Design is compact enough to avoid overfitting on a small dataset
+
+*  Uncertainty: Monte Carlo Dropout
+
+ At inference time, dropout remains active. By performing T = 200 stochastic forward passes, we obtain a sampling-based approximation of the predictive distribution.
+
+ From these samples, we compute:
+
+* Predictive mean
+
+* Lower and upper quantiles
+
+* Coverage probability
+
+* MIS (Mean Interval Score)
+
+This method offers lightweight uncertainty estimation without modifying the training objective.
+
+
+6. Training, Optimization & Tuning :
+ 
+   Training setup
+
+   Optimizer: Adam
+
+   Loss: Mean Squared Error
+
+   Batch size: 32
+
+   Epochs: 100 (with early stopping)
+
+Validation strategy:
+
+A chronological split was used:
+
+ *  Training set
+
+ *  Validation set
+
+Test set:
+
+ * This avoids leakage and maintains temporal integrity.
+
+Hyperparameters :
+
+  * The following key hyperparameters were tuned based on validation loss:
+
+*   LSTM units
+
+*   Dropout rate
+
+*  Sequence lengths
+
+Number of MC samples :
+
+ * Early stopping prevented overfitting, restoring the best model based on validation performance.
+
+7. Benchmark Models & Evaluation Protocol
+
+    To contextualize model performance, a classical forecasting model was implemented:
+
+* ARIMA Baseline
+
+* Model: ARIMA(5,1,0)
+
+Fit on the training portion :
+
+ * Recursive multi-step forecasting
+
+ * Used only for point comparison—ARIMA does not provide uncertainty intervals in this setup.
+
+Evaluation Metrics
+ 
+ * Point Metrics
+
+ * RMSE
+
+ * MAE
+
+   Both measure overall accuracy of the deterministic forecast.
+
+Probabilistic Metrics :
+
+Coverage Probability: proportion of true values inside forecast intervals
+
+Mean Interval Score (MIS): assesses interval width and penalizes misses
+
+These metrics follow the project requirement to focus on uncertainty calibration.
+
+8. Interpretability: Decomposition & Ablation
+
+   A. Forecast Decomposition
+
+    *  To understand how uncertainty behaves across the horizon:
+
+    *  Short horizons show tighter intervals
+
+    *  Longer horizons reflect increasing variance
+
+    *  Intervals widen symmetrically due to sampling distribution
+
+ This behavior aligns with expected forecasting theory: uncertainty compounds over time.
+
+B. Ablation Study: Effect of Dropout
+
+ * An ablation was performed by varying:
+
+ *  Dropout disabled
+
+ *  Dropout at 10%
+
+ * Dropout at 20% (final model)
+
+Findings:
+
+ * Without dropout, intervals collapse unrealistically
+
+* Low dropout yields slight variability but poor coverage
+
+* 20% dropout produces well-calibrated 80% and 95% intervals
+
+  This validates MC Dropout as an effective uncertainty mechanism for this project.
+
+9. Results Summary (How to Reproduce)
+
+ * Point Forecast Results
+
+ * LSTM model produced competitive RMSE and MAE
+
+ * ARIMA baseline generally underperformed, especially for longer horizons
+
+Interval Forecast Results :
+
+* 80% interval: Coverage close to the expected level
+
+* 95% interval: Wider and more stable, with strong calibration
+
+* MIS values reflected a reasonable trade-off between width and accuracy
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
